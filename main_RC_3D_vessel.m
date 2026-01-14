@@ -21,7 +21,7 @@ catch
     fprintf('GPU不可用，使用CPU计算\n');
 end
 % 设置MATLAB多线程
-maxNumCompThreads(feature('numcores')); % 使用所有CPU核心
+% maxNumCompThreads(feature('numcores')); % 使用所有CPU核心
 
 %% ========== 步骤1: 设置参数 ==========
 fprintf('[1/6] 设置参数...\n');

@@ -1,108 +1,178 @@
 function [rf_RC, tstart_RC, rf_CR, tstart_CR] = acquire_rf_data(...
     Tx_row, Rx_col, Tx_col, Rx_row, positions, amplitudes, params)
-%ACQUIRE_RF_DATA 采集Row-Column RF数据
-%   分批次采集以节省内存 - 修复了Field II内存不足的问题
+%ACQUIRE_RF_DATA 采集Row-Column RF数据 - 稳定并行版
+%   修复了频繁初始化导致的 Field II 崩溃问题
 
     N = params.N_elements;
     
+    %% 准备并行环境
+    fprintf('    正在配置并行计算资源...\n');
+    poolobj = gcp('nocreate');
+    if isempty(poolobj)
+        % 如果没有并行池，启动一个（根据电脑核数自动决定数量）
+        parpool('local'); 
+    end
+    
+    % 预先定义好所有 worker 需要的参数，避免传递大对象
+    fs = params.fs;
+    c = params.c;
+    f0 = params.f0;
+    lambda = params.lambda;
+    element_size = params.element_size;
+    kerf = params.kerf;
+
     %% Row发射 -> Column接收
     rf_RC = cell(N, 1);
     tstart_RC = zeros(N, 1);
     
-    for tx = 1:N
-        % 设置发射孔径(单阵元)
-        apo_tx = zeros(1, N);
-        apo_tx(tx) = 1;
-        xdc_apodization(Tx_row, 0, apo_tx);
-        xdc_focus(Tx_row, 0, [0 0 500e-3]);  % 平面波
+    fprintf('    开始并行计算 (Row Tx)...\n');
+    
+    parfor tx = 1:N
+        % 1. 确保当前 Worker 已初始化 Field II (关键修复)
+        ensure_field_init(fs, c);
         
-        % 设置接收孔径(全孔径)
-        xdc_apodization(Rx_col, 0, ones(1, N));
+        % 2. 在 Worker 本地重新创建换能器
+        % (Field II 的对象 ID 是本地的，不能跨 Worker 共享)
+        [Tx_local, Rx_local] = create_local_row_col(N, element_size, kerf, f0, tx, 1);
         
-        % 计算散射响应 (使用分批处理函数)
+        % 3. 执行计算 (带错误保护)
         try
-            [rf, ts] = calc_scat_batched(Tx_row, Rx_col, positions, amplitudes, params.fs);
-            
+            [rf, ts] = calc_scat_batched(Tx_local, Rx_local, positions, amplitudes, fs);
             if ~isempty(rf) && numel(rf) > 50
-                rf_RC{tx} = single(rf);  % 使用单精度节省内存
+                rf_RC{tx} = single(rf);
                 tstart_RC(tx) = ts;
             end
         catch ME
-            fprintf('    警告: Row Tx %d 失败 - %s\n', tx, ME.message);
+            fprintf('    Row Tx %d 出错: %s\n', tx, ME.message);
         end
         
-        if mod(tx, 4) == 0
-            fprintf('    Row Tx: %d/%d\n', tx, N);
-        end
+        % 4. 释放本地换能器内存 (但不关闭 Field II)
+        xdc_free(Tx_local);
+        xdc_free(Rx_local);
     end
     
     %% Column发射 -> Row接收
     rf_CR = cell(N, 1);
     tstart_CR = zeros(N, 1);
     
-    for tx = 1:N
-        apo_tx = zeros(1, N);
-        apo_tx(tx) = 1;
-        xdc_apodization(Tx_col, 0, apo_tx);
-        xdc_focus(Tx_col, 0, [0 0 500e-3]);
+    fprintf('    开始并行计算 (Col Tx)...\n');
+    
+    parfor tx = 1:N
+        ensure_field_init(fs, c);
         
-        xdc_apodization(Rx_row, 0, ones(1, N));
+        % mode=2 表示 Col 发射, Row 接收
+        [Tx_local, Rx_local] = create_local_row_col(N, element_size, kerf, f0, tx, 2);
         
         try
-            [rf, ts] = calc_scat_batched(Tx_col, Rx_row, positions, amplitudes, params.fs);
-            
+            [rf, ts] = calc_scat_batched(Tx_local, Rx_local, positions, amplitudes, fs);
             if ~isempty(rf) && numel(rf) > 50
                 rf_CR{tx} = single(rf);
                 tstart_CR(tx) = ts;
             end
         catch ME
-            fprintf('    警告: Col Tx %d 失败 - %s\n', tx, ME.message);
+            fprintf('    Col Tx %d 出错: %s\n', tx, ME.message);
         end
         
-        if mod(tx, 4) == 0
-            fprintf('    Col Tx: %d/%d\n', tx, N);
-        end
+        xdc_free(Tx_local);
+        xdc_free(Rx_local);
     end
     
-    fprintf('    有效数据: RC=%d, CR=%d\n', sum(~cellfun(@isempty, rf_RC)), ...
-            sum(~cellfun(@isempty, rf_CR)));
+    fprintf('    有效数据: RC=%d, CR=%d\n', ...
+            sum(~cellfun(@isempty, rf_RC)), sum(~cellfun(@isempty, rf_CR)));
+end
+
+%% === 辅助函数 ===
+
+function ensure_field_init(fs, c)
+%ENSURE_FIELD_INIT 确保当前 Worker 已初始化 Field II
+%   使用 persistent 变量避免重复初始化
+    persistent is_initialized
+    if isempty(is_initialized) || ~is_initialized
+        % 尝试一个简单命令测试是否存活
+        try
+            set_field('c', c);
+        catch
+            % 如果失败或未初始化，则重新初始化
+            field_init(-1);
+            set_field('fs', fs);
+            set_field('c', c);
+            set_field('use_triangles', 0); % 关闭三角形加速以提高稳定性
+        end
+        is_initialized = true;
+    end
+end
+
+function [Tx, Rx] = create_local_row_col(N, width, kerf, f0, tx_idx, mode)
+%CREATE_LOCAL_ROW_COL 在 Worker 内部创建换能器配置
+    
+    height = 5e-3; % 假设高度
+    
+    % 创建线性阵列
+    % 注意：Field II 对象是指针，必须在同一个线程内创建和使用
+    Tx_array = xdc_linear_array(N, width, height, kerf, 1, 1, [0 0 Inf]);
+    Rx_array = xdc_linear_array(N, width, height, kerf, 1, 1, [0 0 Inf]);
+    
+    % 设置脉冲响应
+    impulse_resp = gauspuls('cutoff', f0, 0.6, [], -6);
+    xdc_impulse(Tx_array, impulse_resp);
+    xdc_impulse(Rx_array, impulse_resp);
+    xdc_excitation(Tx_array, impulse_resp);
+    
+    % 设置聚焦和变迹
+    if mode == 1 % Row -> Col
+        Tx = Tx_array;
+        Rx = Rx_array;
+    else % Col -> Row
+        Tx = Rx_array; % 交换物理意义
+        Rx = Tx_array;
+    end
+    
+    % 发射：单阵元激活
+    apo_tx = zeros(1, N);
+    apo_tx(tx_idx) = 1;
+    xdc_apodization(Tx, 0, apo_tx);
+    xdc_focus(Tx, 0, [0 0 100]); % 远场聚焦（平面波）
+    
+    % 接收：全孔径
+    xdc_apodization(Rx, 0, ones(1, N));
+    xdc_focus(Rx, 0, [0 0 0]); % 动态聚焦通常在波束形成中做，这里设0
 end
 
 function [rf_total, tstart_total] = calc_scat_batched(Tx, Rx, pos, amp, fs)
-%CALC_SCAT_BATCHED 分批计算散射以避免Field II内存溢出
-    
-    BATCH_SIZE = 1000; % 关键参数：每批次处理的点数，显存不足可继续调小
+%CALC_SCAT_BATCHED 分批计算散射
+    BATCH_SIZE = 500; 
     n_points = size(pos, 1);
     
-    % 如果点数很少，直接计算，无需分批
+    % 1. 小数据量直接计算 (加了 try-catch 保护)
     if n_points <= BATCH_SIZE
-        [rf_total, tstart_total] = calc_scat(Tx, Rx, pos, amp);
+        try
+            [rf_total, tstart_total] = calc_scat(Tx, Rx, pos, amp);
+        catch
+            rf_total = [];
+            tstart_total = 0;
+        end
         return;
     end
     
-    % 初始化分批变量
+    % 2. 大数据量分批
     n_batches = ceil(n_points / BATCH_SIZE);
     rf_parts = cell(n_batches, 1);
     tstart_parts = zeros(n_batches, 1);
     valid_mask = false(n_batches, 1);
     
-    % 循环计算每一批
     for b = 1:n_batches
         idx_start = (b-1)*BATCH_SIZE + 1;
         idx_end = min(b*BATCH_SIZE, n_points);
         
-        pos_batch = pos(idx_start:idx_end, :);
-        amp_batch = amp(idx_start:idx_end);
-        
         try
-            [rf, ts] = calc_scat(Tx, Rx, pos_batch, amp_batch);
+            [rf, ts] = calc_scat(Tx, Rx, pos(idx_start:idx_end, :), amp(idx_start:idx_end));
             if ~isempty(rf)
                 rf_parts{b} = rf;
                 tstart_parts(b) = ts;
                 valid_mask(b) = true;
             end
         catch
-            % 忽略空批次或失败批次
+            % 单个批次失败不影响整体
         end
     end
     
@@ -112,37 +182,28 @@ function [rf_total, tstart_total] = calc_scat_batched(Tx, Rx, pos, amp, fs)
         return;
     end
     
-    % --- 合并结果（核心逻辑：按时间对齐叠加）---
+    % 合并逻辑
     valid_indices = find(valid_mask);
-    
-    % 1. 找到最早的起始时间
     min_tstart = min(tstart_parts(valid_indices));
     tstart_total = min_tstart;
     
-    % 2. 计算合成信号所需的总长度
-    max_sample_index = 0;
+    % 计算最大样本长度
+    max_len = 0;
     for i = 1:length(valid_indices)
         idx = valid_indices(i);
-        % 计算当前批次相对于最早时间的样本偏移量
-        start_sample_offset = round((tstart_parts(idx) - min_tstart) * fs);
-        end_sample_index = start_sample_offset + size(rf_parts{idx}, 1);
-        if end_sample_index > max_sample_index
-            max_sample_index = end_sample_index;
-        end
+        offset = round((tstart_parts(idx) - min_tstart) * fs);
+        end_idx = offset + size(rf_parts{idx}, 1);
+        if end_idx > max_len, max_len = end_idx; end
     end
     
-    % 3. 初始化总RF数据并叠加
-    n_channels = size(rf_parts{valid_indices(1)}, 2);
-    rf_total = zeros(max_sample_index, n_channels);
+    rf_total = zeros(max_len, size(rf_parts{valid_indices(1)}, 2));
     
     for i = 1:length(valid_indices)
         idx = valid_indices(i);
-        rf = rf_parts{idx};
-        start_sample_offset = round((tstart_parts(idx) - min_tstart) * fs);
-        
-        s_idx = start_sample_offset + 1;
-        e_idx = start_sample_offset + size(rf, 1);
-        
-        rf_total(s_idx:e_idx, :) = rf_total(s_idx:e_idx, :) + rf;
+        offset = round((tstart_parts(idx) - min_tstart) * fs);
+        current_rf = rf_parts{idx};
+        s = offset + 1;
+        e = offset + size(current_rf, 1);
+        rf_total(s:e, :) = rf_total(s:e, :) + current_rf;
     end
 end
