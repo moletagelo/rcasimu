@@ -30,12 +30,12 @@ function params = setup_parameters()
     params.dt_frame = 1/params.PRF;
     
     %% 散射点数量 (大幅减少以节省内存)
-    params.n_blood = 500;               % 血液散射点 (原2000改为500)
-    params.n_wall = 300;                % 血管壁散射点 (原1000改为300)
-    params.n_tissue = 800;              % 组织散射点 (原5000改为800)
+    params.n_blood = 500;               % 血液散射点 
+    params.n_wall = 300;                % 血管壁散射点 
+    params.n_tissue = 800;              % 组织散射点 
     
     %% 仿真帧数
-    params.n_frames = 10;                % 帧数 (原5改为4)
+    params.n_frames = 10;                % 帧数 
     
     %% 成像网格 (减少分辨率以节省内存)
     params.n_x = 32;                    % X方向像素 (原48改为32)

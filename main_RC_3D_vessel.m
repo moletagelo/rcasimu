@@ -10,6 +10,19 @@ fprintf('==============================================\n');
 fprintf('  Row-Column 三维动态血管成像仿真\n');
 fprintf('==============================================\n\n');
 
+%% ======================= 检查GPU可用性 =======================
+parallel.gpu.enableCUDAForwardCompatibility(true)
+try
+    gpuDev = gpuDevice(1);
+    gpu_available = true;
+    fprintf('GPU加速已启用: %s\n', gpuDev.Name);
+catch
+    gpu_available = false;
+    fprintf('GPU不可用，使用CPU计算\n');
+end
+% 设置MATLAB多线程
+maxNumCompThreads(feature('numcores')); % 使用所有CPU核心
+
 %% ========== 步骤1: 设置参数 ==========
 fprintf('[1/6] 设置参数...\n');
 params = setup_parameters();
@@ -20,6 +33,7 @@ field_init(-1);
 set_field('fs', params.fs);
 set_field('c', params.c);
 fprintf('  Field II初始化完成\n');
+set_field('use_triangles', 1);
 
 %% ========== 步骤3: 创建换能器 ==========
 fprintf('[3/6] 创建换能器...\n');
