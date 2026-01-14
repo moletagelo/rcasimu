@@ -9,7 +9,7 @@ function params = setup_parameters()
     params.lambda = params.c / params.f0;
     
     %% 阵列参数 (减少阵元数以节省内存)
-    params.N_elements = 128;             % 每个方向阵元数 
+    params.N_elements = 32;             % 每个方向阵元数 
     params.pitch = params.lambda;       % 阵元间距
     params.kerf = 0.01e-3;             % 阵元间隙
     params.element_size = params.pitch - params.kerf;
